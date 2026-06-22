@@ -25,10 +25,22 @@ import {
 } from '../types';
 import { SSHTransport } from '../ssh/transport';
 import { SSHPacketParser, SSHPacketBuilder } from '../ssh/packet';
-import { KEXInitBuilder, parseKEXInit, negotiate } from '../ssh/kex';
+import {
+  KEXInitBuilder,
+  parseKEXInit,
+  negotiate
+} from '../ssh/kex';
+import {
+  getCipherSpec,
+  getMacAlgorithmsForCipher,
+  getMacSpec,
+  KEX_ALGORITHM_ECDH_NISTP256,
+  isCurve25519KEXAlgorithm
+} from '../ssh/algorithms';
 import { ECDHKeyExchange } from '../ssh/kex-ecdh';
+import { Curve25519KeyExchange, Curve25519KeyPair } from '../ssh/kex-curve25519';
 import { KeyDerivation } from '../ssh/keys';
-import { SSHAESGCMCipher } from '../ssh/crypto';
+import { SSHAESCTRCipher, SSHAESGCMCipher, SSHHMAC } from '../ssh/crypto';
 import { SSHAuth } from '../ssh/auth';
 import { SSHChannel } from '../ssh/channel';
 
@@ -41,8 +53,10 @@ export class SSHSession {
   private transport: SSHTransport;
   private packetParser: SSHPacketParser;
   private channel: SSHChannel;
-  private encryptCipher: SSHAESGCMCipher | null = null;
-  private decryptCipher: SSHAESGCMCipher | null = null;
+  private encryptCipher: SSHAESGCMCipher | SSHAESCTRCipher | null = null;
+  private decryptCipher: SSHAESGCMCipher | SSHAESCTRCipher | null = null;
+  private encryptMac: SSHHMAC | null = null;
+  private decryptMac: SSHHMAC | null = null;
   private derivedKeys: SessionKeys | null = null;
 
   private seqNumSend: number = 0;
@@ -52,8 +66,10 @@ export class SSHSession {
   private kexInitLocal: Uint8Array | null = null;
   private kexInitRemote: Uint8Array | null = null;
 
-  private ecdhKeyPair!: CryptoKeyPair;
-  private ecdhRawPublicKey!: Uint8Array;
+  private negotiatedKexAlgorithm: string | null = null;
+  private ecdhKeyPair: CryptoKeyPair | null = null;
+  private curve25519KeyPair: Curve25519KeyPair | null = null;
+  private kexRawPublicKey: Uint8Array | null = null;
 
   private state: 'connecting' | 'version' | 'kex' | 'auth' | 'shell' | 'ready'
     = 'connecting';
@@ -62,6 +78,8 @@ export class SSHSession {
   private versionRawBuffer: Uint8Array = new Uint8Array(0);
   private negotiatedCipherC2S: string = 'aes256-gcm@openssh.com';
   private negotiatedCipherS2C: string = 'aes256-gcm@openssh.com';
+  private negotiatedMacC2S: string = 'none';
+  private negotiatedMacS2C: string = 'none';
 
   private keepaliveInterval: ReturnType<typeof setInterval> | null = null;
 
@@ -196,16 +214,33 @@ export class SSHSession {
     );
     await this.writeSocket(packet);
     console.log('[KEX] KEXINIT sent');
+  }
 
-    this.ecdhKeyPair = await ECDHKeyExchange.generateKeyPair();
-    this.ecdhRawPublicKey = await ECDHKeyExchange.exportRawPublicKey(this.ecdhKeyPair);
+  private async sendKEXECDHInit(): Promise<void> {
+    if (!this.negotiatedKexAlgorithm) {
+      throw new Error('KEX algorithm not negotiated');
+    }
 
-    const ecdhInit = ECDHKeyExchange.buildInit(this.ecdhRawPublicKey);
+    let kexInit: Uint8Array;
+    if (isCurve25519KEXAlgorithm(this.negotiatedKexAlgorithm)) {
+      this.curve25519KeyPair = await Curve25519KeyExchange.generateKeyPair();
+      this.ecdhKeyPair = null;
+      this.kexRawPublicKey = await Curve25519KeyExchange.exportRawPublicKey(this.curve25519KeyPair);
+      kexInit = Curve25519KeyExchange.buildInit(this.kexRawPublicKey);
+    } else if (this.negotiatedKexAlgorithm === KEX_ALGORITHM_ECDH_NISTP256) {
+      this.ecdhKeyPair = await ECDHKeyExchange.generateKeyPair();
+      this.curve25519KeyPair = null;
+      this.kexRawPublicKey = await ECDHKeyExchange.exportRawPublicKey(this.ecdhKeyPair);
+      kexInit = ECDHKeyExchange.buildInit(this.kexRawPublicKey);
+    } else {
+      throw new Error(`Unsupported KEX algorithm: ${this.negotiatedKexAlgorithm}`);
+    }
+
     const ecdhPacket = await SSHPacketBuilder.build(
-      ecdhInit, 8, null, this.seqNumSend++
+      kexInit, 8, null, this.seqNumSend++
     );
     await this.writeSocket(ecdhPacket);
-    console.log('[KEX] ECDH_INIT sent, waiting for server reply');
+    console.log(`[KEX] ECDH_INIT sent using ${this.negotiatedKexAlgorithm}, waiting for server reply`);
   }
 
   private async writeSocket(data: Uint8Array): Promise<void> {
@@ -214,8 +249,29 @@ export class SSHSession {
     writer.releaseLock();
   }
 
+  private async buildEncryptedPacket(payload: Uint8Array): Promise<Uint8Array> {
+    if (!this.encryptCipher) {
+      throw new Error('Encryption not initialized');
+    }
+
+    const cipher = getCipherSpec(this.negotiatedCipherC2S);
+    return SSHPacketBuilder.build(
+      payload,
+      cipher.blockSize,
+      (data, seq, aad) => this.encryptCipher!.encrypt(data, seq, aad),
+      this.seqNumSend++,
+      cipher.aead,
+      this.encryptMac
+        ? (packetData, seq) => this.encryptMac!.sign(packetData, seq)
+        : undefined
+    );
+  }
+
   private async processPackets(): Promise<void> {
-    const blockSize = this.decryptCipher ? 16 : 8;
+    const cipher = this.decryptCipher ? getCipherSpec(this.negotiatedCipherS2C) : null;
+    const blockSize = cipher ? cipher.blockSize : 8;
+    const hasAuthTag = !!cipher?.aead;
+    const macLength = this.decryptCipher && !hasAuthTag ? getMacSpec(this.negotiatedMacS2C).length : 0;
     const hasDecrypt = !!this.decryptCipher;
     this.sendDebug(`processPackets: blockSize=${blockSize}, hasDecrypt=${hasDecrypt}, bufferLen=${this.packetParser.getBufferLength()}`);
 
@@ -224,9 +280,13 @@ export class SSHSession {
         const packet = await this.packetParser.nextPacket(
           blockSize,
           this.decryptCipher
-            ? (data, seq, aad) => this.decryptCipher!.decrypt(data, seq, aad)
+            ? (data, seq, aad, commit) => this.decryptCipher!.decrypt(data, seq, aad, commit)
             : (data) => data,
-          !!this.decryptCipher
+          hasAuthTag,
+          macLength,
+          this.decryptMac
+            ? (packet, mac, seq) => this.decryptMac!.verify(packet, seq, mac)
+            : undefined
         );
 
         if (!packet) {
@@ -329,9 +389,17 @@ export class SSHSession {
         try {
           const serverKex = parseKEXInit(payload);
           const clientKex = parseKEXInit(this.kexInitLocal!);
-          this.negotiatedCipherC2S = negotiate(clientKex.encryptionC2S, serverKex.encryptionC2S);
-          this.negotiatedCipherS2C = negotiate(clientKex.encryptionS2C, serverKex.encryptionS2C);
-          this.sendDebug(`Negotiated C2S: ${this.negotiatedCipherC2S}, S2C: ${this.negotiatedCipherS2C}`);
+          this.negotiatedKexAlgorithm = negotiate(clientKex.kexAlgorithms, serverKex.kexAlgorithms, 'KEX algorithm');
+          this.negotiatedCipherC2S = negotiate(clientKex.encryptionC2S, serverKex.encryptionC2S, 'C2S cipher');
+          this.negotiatedCipherS2C = negotiate(clientKex.encryptionS2C, serverKex.encryptionS2C, 'S2C cipher');
+          this.negotiatedMacC2S = getCipherSpec(this.negotiatedCipherC2S).aead
+            ? 'none'
+            : negotiate(getMacAlgorithmsForCipher(this.negotiatedCipherC2S), serverKex.macC2S, 'C2S MAC');
+          this.negotiatedMacS2C = getCipherSpec(this.negotiatedCipherS2C).aead
+            ? 'none'
+            : negotiate(getMacAlgorithmsForCipher(this.negotiatedCipherS2C), serverKex.macS2C, 'S2C MAC');
+          this.sendDebug(`Negotiated KEX: ${this.negotiatedKexAlgorithm}, C2S: ${this.negotiatedCipherC2S}/${this.negotiatedMacC2S}, S2C: ${this.negotiatedCipherS2C}/${this.negotiatedMacS2C}`);
+          await this.sendKEXECDHInit();
         } catch (e) {
           const errMsg = e instanceof Error ? e.message : String(e);
           this.sendError('算法协商失败: ' + errMsg);
@@ -386,22 +454,53 @@ export class SSHSession {
       ECDHKeyExchange.parseReply(payload);
     this.sendDebug(`ECDH_REPLY parsed: hostKey=${hostKey.length}, serverPubKey=${serverRawPublicKey.length}, sig=${signature.length}`);
 
-    const sharedSecret = await ECDHKeyExchange.computeSharedSecret(
-      this.ecdhKeyPair.privateKey,
-      serverRawPublicKey
-    );
+    if (!this.negotiatedKexAlgorithm || !this.kexRawPublicKey) {
+      throw new Error('KEX reply received before KEX init was sent');
+    }
+
+    let sharedSecret: Uint8Array;
+    if (isCurve25519KEXAlgorithm(this.negotiatedKexAlgorithm)) {
+      if (!this.curve25519KeyPair) {
+        throw new Error('Curve25519 key pair not initialized');
+      }
+      sharedSecret = await Curve25519KeyExchange.computeSharedSecret(
+        this.curve25519KeyPair.privateKey,
+        serverRawPublicKey
+      );
+    } else if (this.negotiatedKexAlgorithm === KEX_ALGORITHM_ECDH_NISTP256) {
+      if (!this.ecdhKeyPair) {
+        throw new Error('ECDH key pair not initialized');
+      }
+      sharedSecret = await ECDHKeyExchange.computeSharedSecret(
+        this.ecdhKeyPair.privateKey,
+        serverRawPublicKey
+      );
+    } else {
+      throw new Error(`Unsupported KEX algorithm: ${this.negotiatedKexAlgorithm}`);
+    }
     this.sendDebug(`Shared secret: ${sharedSecret.length} bytes`);
 
-    const H = await ECDHKeyExchange.computeExchangeHash(
-      this.transport.getLocalVersion(),
-      this.transport.getRemoteVersion(),
-      this.kexInitLocal!,
-      this.kexInitRemote!,
-      hostKey,
-      this.ecdhRawPublicKey,
-      serverRawPublicKey,
-      sharedSecret
-    );
+    const H = isCurve25519KEXAlgorithm(this.negotiatedKexAlgorithm)
+      ? await Curve25519KeyExchange.computeExchangeHash(
+          this.transport.getLocalVersion(),
+          this.transport.getRemoteVersion(),
+          this.kexInitLocal!,
+          this.kexInitRemote!,
+          hostKey,
+          this.kexRawPublicKey,
+          serverRawPublicKey,
+          sharedSecret
+        )
+      : await ECDHKeyExchange.computeExchangeHash(
+          this.transport.getLocalVersion(),
+          this.transport.getRemoteVersion(),
+          this.kexInitLocal!,
+          this.kexInitRemote!,
+          hostKey,
+          this.kexRawPublicKey,
+          serverRawPublicKey,
+          sharedSecret
+        );
     const hHex = Array.from(H).map(b => b.toString(16).padStart(2, '0')).join('');
     this.sendDebug(`Exchange hash H=${hHex}`);
 
@@ -449,7 +548,20 @@ export class SSHSession {
       this.sendDebug('Session ID set');
     }
 
-    this.derivedKeys = await KeyDerivation.deriveKeys(sharedSecret, H, this.sessionID!);
+    const cipherC2S = getCipherSpec(this.negotiatedCipherC2S);
+    const cipherS2C = getCipherSpec(this.negotiatedCipherS2C);
+    const macC2S = getMacSpec(this.negotiatedMacC2S);
+    const macS2C = getMacSpec(this.negotiatedMacS2C);
+
+    this.derivedKeys = await KeyDerivation.deriveKeys(
+      sharedSecret,
+      H,
+      this.sessionID!,
+      cipherC2S.ivLength,
+      cipherS2C.ivLength,
+      macC2S.keyLength,
+      macS2C.keyLength
+    );
     this.sendDebug('Keys derived, waiting for NEWKEYS');
   }
 
@@ -622,29 +734,36 @@ export class SSHSession {
 
   private async enableEncryption(): Promise<void> {
     const keys = this.derivedKeys!;
-    let encKeyC2S = keys.encKeyClientToServer;
-    let encKeyS2C = keys.encKeyServerToClient;
-
-    if (this.negotiatedCipherC2S === 'aes128-gcm@openssh.com') {
-      encKeyC2S = encKeyC2S.slice(0, 16);
-    }
-    if (this.negotiatedCipherS2C === 'aes128-gcm@openssh.com') {
-      encKeyS2C = encKeyS2C.slice(0, 16);
-    }
+    const cipherC2S = getCipherSpec(this.negotiatedCipherC2S);
+    const cipherS2C = getCipherSpec(this.negotiatedCipherS2C);
+    const encKeyC2S = keys.encKeyClientToServer.slice(0, cipherC2S.keyLength);
+    const encKeyS2C = keys.encKeyServerToClient.slice(0, cipherS2C.keyLength);
 
     this.sendDebug('Initializing ciphers');
 
-    this.encryptCipher = new SSHAESGCMCipher(
-      encKeyC2S,
-      keys.ivClientToServer
-    );
+    if (cipherC2S.mode === 'gcm') {
+      this.encryptCipher = new SSHAESGCMCipher(encKeyC2S, keys.ivClientToServer);
+      this.encryptMac = null;
+    } else {
+      this.encryptCipher = new SSHAESCTRCipher(encKeyC2S, keys.ivClientToServer);
+      this.encryptMac = this.negotiatedMacC2S === 'none'
+        ? null
+        : new SSHHMAC(this.negotiatedMacC2S, keys.integrityKeyC2S);
+    }
     await this.encryptCipher.init();
+    if (this.encryptMac) await this.encryptMac.init();
 
-    this.decryptCipher = new SSHAESGCMCipher(
-      encKeyS2C,
-      keys.ivServerToClient
-    );
+    if (cipherS2C.mode === 'gcm') {
+      this.decryptCipher = new SSHAESGCMCipher(encKeyS2C, keys.ivServerToClient);
+      this.decryptMac = null;
+    } else {
+      this.decryptCipher = new SSHAESCTRCipher(encKeyS2C, keys.ivServerToClient);
+      this.decryptMac = this.negotiatedMacS2C === 'none'
+        ? null
+        : new SSHHMAC(this.negotiatedMacS2C, keys.integrityKeyS2C);
+    }
     await this.decryptCipher.init();
+    if (this.decryptMac) await this.decryptMac.init();
 
     this.sendDebug('Ciphers initialized');
   }
@@ -660,15 +779,7 @@ export class SSHSession {
     console.log('[AUTH] SERVICE_REQUEST payload len=' + serviceRequest.length + ', seqNum=' + this.seqNumSend);
     console.log('[AUTH] encryptCipher exists=' + !!this.encryptCipher);
 
-    const packet = await SSHPacketBuilder.build(
-      serviceRequest, 16,
-      (data, seq, aad) => {
-        console.log('[AUTH] Encrypting: dataLen=' + data.length + ', seq=' + seq + ', aadLen=' + aad?.length);
-        return this.encryptCipher!.encrypt(data, seq, aad);
-      },
-      this.seqNumSend++,
-      true
-    );
+    const packet = await this.buildEncryptedPacket(serviceRequest);
     console.log('[AUTH] Encrypted packet len=' + packet.length + ', first16=' + Array.from(packet.slice(0, 16)).map(b => b.toString(16).padStart(2, '0')).join(''));
     await this.writeSocket(packet);
     console.log('[AUTH] SERVICE_REQUEST sent to socket');
@@ -691,12 +802,7 @@ export class SSHSession {
       );
     }
 
-    const packet = await SSHPacketBuilder.build(
-      authRequest, 16,
-      (data, seq, aad) => this.encryptCipher!.encrypt(data, seq, aad),
-      this.seqNumSend++,
-      true
-    );
+    const packet = await this.buildEncryptedPacket(authRequest);
     await this.writeSocket(packet);
   }
 
@@ -823,16 +929,7 @@ export class SSHSession {
 
   private async sendEncrypted(payload: Uint8Array): Promise<void> {
     const operation = this.sendMutex.then(async () => {
-      if (!this.encryptCipher) {
-        throw new Error('Encryption not initialized');
-      }
-
-      const encrypted = await SSHPacketBuilder.build(
-        payload, 16,
-        (data, seq, aad) => this.encryptCipher!.encrypt(data, seq, aad),
-        this.seqNumSend++,
-        true
-      );
+      const encrypted = await this.buildEncryptedPacket(payload);
       await this.writeSocket(encrypted);
     });
 
