@@ -26,7 +26,7 @@ import {
   SSH_MSG_UNIMPLEMENTED,
 } from '../types';
 import { SSHTransport } from '../ssh/transport';
-import { SSHPacketParser, SSHPacketBuilder } from '../ssh/packet';
+import { SSHPacketParser, SSHPacketBuilder, nextSequenceNumber } from '../ssh/packet';
 import {
   KEXInitBuilder,
   parseKEXInit,
@@ -121,6 +121,7 @@ export class SSHSession {
   private confirmationResolve: ((approved: boolean) => void) | null = null;
   private env: Env | null = null;
   private userId: string | null = null;
+  private githubId: string | null = null;
 
   constructor(
     ws: WebSocket,
@@ -131,6 +132,7 @@ export class SSHSession {
     sftpAttachUrl?: string,
     env?: Env,
     userId?: string,
+    githubId?: string,
   ) {
     this.ws = ws;
     this.socket = socket;
@@ -140,6 +142,7 @@ export class SSHSession {
     this.sftpAttachUrl = sftpAttachUrl;
     this.env = env || null;
     this.userId = userId || null;
+    this.githubId = githubId || null;
 
     this.transport = new SSHTransport();
     this.packetParser = new SSHPacketParser();
@@ -267,8 +270,9 @@ export class SSHSession {
     this.kexInitLocal = KEXInitBuilder.build();
 
     const packet = await SSHPacketBuilder.build(
-      this.kexInitLocal, 8, null, this.seqNumSend++
+      this.kexInitLocal, 8, null, this.seqNumSend
     );
+    this.seqNumSend = nextSequenceNumber(this.seqNumSend);
     await this.writeSocket(packet);
   }
 
@@ -292,10 +296,11 @@ export class SSHSession {
       throw new Error(`Unsupported KEX algorithm: ${this.negotiatedKexAlgorithm}`);
     }
 
-    const ecdhPacket = await SSHPacketBuilder.build(
-      kexInit, 8, null, this.seqNumSend++
+    const packet = await SSHPacketBuilder.build(
+      kexInit, 8, null, this.seqNumSend
     );
-    await this.writeSocket(ecdhPacket);
+    this.seqNumSend = nextSequenceNumber(this.seqNumSend);
+    await this.writeSocket(packet);
   }
 
   private async writeSocket(data: Uint8Array): Promise<void> {
@@ -311,16 +316,18 @@ export class SSHSession {
     }
 
     const cipher = getCipherSpec(this.negotiatedCipherC2S);
-    return SSHPacketBuilder.build(
+    const packet = await SSHPacketBuilder.build(
       payload,
       cipher.blockSize,
       (data, seq, aad) => this.encryptCipher!.encrypt(data, seq, aad),
-      this.seqNumSend++,
+      this.seqNumSend,
       cipher.aead,
       this.encryptMac
         ? (packetData, seq) => this.encryptMac!.sign(packetData, seq)
         : undefined
     );
+    this.seqNumSend = nextSequenceNumber(this.seqNumSend);
+    return packet;
   }
 
   private async buildEncryptedChannelDataPacket(chunk: ChannelDataChunk, channel: SSHChannel): Promise<Uint8Array> {
@@ -329,7 +336,7 @@ export class SSHSession {
     }
 
     const cipher = getCipherSpec(this.negotiatedCipherC2S);
-    return SSHPacketBuilder.buildWithPayloadWriter(
+    const packet = await SSHPacketBuilder.buildWithPayloadWriter(
       chunk.payloadLength,
       (packet, offset) => channel.writeChannelDataPayload(
         packet,
@@ -340,12 +347,14 @@ export class SSHSession {
       ),
       cipher.blockSize,
       (data, seq, aad) => this.encryptCipher!.encrypt(data, seq, aad),
-      this.seqNumSend++,
+      this.seqNumSend,
       cipher.aead,
       this.encryptMac
         ? (packetData, seq) => this.encryptMac!.sign(packetData, seq)
         : undefined
     );
+    this.seqNumSend = nextSequenceNumber(this.seqNumSend);
+    return packet;
   }
 
   private async processPackets(): Promise<void> {
@@ -545,11 +554,10 @@ export class SSHSession {
         this.sendDebug(`Received NEWKEYS, seqNumSend=${this.seqNumSend}`);
         const newKeys = new Uint8Array([SSH_MSG_NEWKEYS]);
         const packet = await SSHPacketBuilder.build(
-          newKeys, 8, null, this.seqNumSend++
+          newKeys, 8, null, this.seqNumSend
         );
+        this.seqNumSend = nextSequenceNumber(this.seqNumSend);
         await this.writeSocket(packet);
-        this.seqNumSend = 0;
-        this.packetParser.resetSeqNum();
         this.sendDebug(`Client NEWKEYS sent, seqNumSend=${this.seqNumSend}`);
 
         await this.enableEncryption();
@@ -1721,7 +1729,7 @@ export class SSHSession {
       this.agentCore = new AgentCore(
         this.terminalContext,
         (msg: any) => this.sendAgentFrame(msg),
-        async (uid: string) => this.fetchAgentAIConfig(uid),
+        async (uid: string) => this.fetchAgentAIConfig(uid, this.githubId!),
         async (command: string, timeout: number, signal?: AbortSignal) => this.executeAgentCommand(command, timeout, signal),
         async (command: string, reason: string) => this.askAgentConfirmation(command, reason),
       );
@@ -1748,10 +1756,10 @@ export class SSHSession {
     }
   }
 
-  private async fetchAgentAIConfig(userId: string): Promise<{ base_url: string; model: string; api_key: string } | null> {
+  private async fetchAgentAIConfig(userId: string, githubId: string): Promise<{ base_url: string; model: string; api_key: string } | null> {
     if (!this.env) return null;
     try {
-      const stub = this.env.USER_DB.get(this.env.USER_DB.idFromName('global'));
+      const stub = this.env.USER_DB.get(this.env.USER_DB.idFromName(githubId));
       const res = await stub.fetch(
         new Request(`http://internal/internal/ai-config/decrypt?user_id=${userId}`)
       );

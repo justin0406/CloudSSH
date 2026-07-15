@@ -13,23 +13,48 @@ export { UserDBDO } from './user-db';
 
 const RATE_LIMIT_MAX = 10;      // max requests per window
 const RATE_LIMIT_WINDOW = 60000; // 1 minute window
+const RATE_LIMIT_MAX_ENTRIES = 10000;
+const RATE_LIMIT_CLEANUP_INTERVAL = 256;
 
-// 分布式速率限制（使用 Durable Object）
-async function isDistributedRateLimited(env: Env, ip: string): Promise<boolean> {
-  try {
-    const stub = getUserDBStub(env);
-    const response = await stub.fetch(new Request('http://internal/internal/rate-limit/check', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ip, maxRequests: RATE_LIMIT_MAX, windowMs: RATE_LIMIT_WINDOW }),
-    }));
+// Worker 实例级削峰；Turnstile 和一次性 token 仍负责实际连接鉴权。
+const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
+let rateLimitChecks = 0;
 
-    if (!response.ok) return false;
-    const result = await response.json<{ limited: boolean }>();
-    return result.limited;
-  } catch {
-    return false;
+function cleanExpiredRateLimits(now: number): void {
+  for (const [ip, record] of rateLimitMap) {
+    if (now >= record.resetAt) {
+      rateLimitMap.delete(ip);
+    }
   }
+}
+
+function getRateLimitRetryAfter(ip: string | null): number | null {
+  if (!ip) return null;
+
+  const now = Date.now();
+  rateLimitChecks++;
+  if (rateLimitChecks % RATE_LIMIT_CLEANUP_INTERVAL === 0) {
+    cleanExpiredRateLimits(now);
+  }
+
+  let record = rateLimitMap.get(ip);
+
+  if (!record || now >= record.resetAt) {
+    if (!record && rateLimitMap.size >= RATE_LIMIT_MAX_ENTRIES) {
+      const oldestIP = rateLimitMap.keys().next().value;
+      if (oldestIP !== undefined) rateLimitMap.delete(oldestIP);
+    }
+    record = { count: 1, resetAt: now + RATE_LIMIT_WINDOW };
+    rateLimitMap.set(ip, record);
+    return null;
+  }
+
+  if (record.count >= RATE_LIMIT_MAX) {
+    return Math.max(1, Math.ceil((record.resetAt - now) / 1000));
+  }
+
+  record.count++;
+  return null;
 }
 
 async function verifyTurnstile(token: string, secret: string, ip: string): Promise<boolean> {
@@ -108,8 +133,8 @@ async function isVerifiedTokenValid(token: string, secret: string): Promise<bool
 }
 
 // --- UserDBDO helper ---
-function getUserDBStub(env: Env): DurableObjectStub {
-  const id = env.USER_DB.idFromName('global');
+function getUserDBStub(env: Env, githubId: string | number): DurableObjectStub {
+  const id = env.USER_DB.idFromName(githubId.toString());
   return env.USER_DB.get(id);
 }
 
@@ -205,10 +230,13 @@ export default {
     }
 
     if (url.pathname === '/api/ssh') {
-      // Apply rate limiting (distributed via Durable Object)
-      const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown';
-      if (await isDistributedRateLimited(env, clientIP)) {
-        return new Response('Too Many Requests', { status: 429 });
+      const clientIP = request.headers.get('CF-Connecting-IP');
+      const retryAfter = getRateLimitRetryAfter(clientIP);
+      if (retryAfter !== null) {
+        return new Response('Too Many Requests', {
+          status: 429,
+          headers: { 'Retry-After': String(retryAfter) },
+        });
       }
 
       // Check for one-time-token (from server management connect)
@@ -230,7 +258,7 @@ export default {
           if (!turnstileToken) {
             return Response.json({ error: 'Missing Turnstile token' }, { status: 403 });
           }
-          const isValid = await verifyTurnstile(turnstileToken, env.TURNSTILE_SECRET, clientIP);
+          const isValid = await verifyTurnstile(turnstileToken, env.TURNSTILE_SECRET, clientIP || '');
           if (!isValid) {
             return Response.json({ error: 'Turnstile verification failed' }, { status: 403 });
           }
@@ -279,7 +307,7 @@ async function handleServersRoute(request: Request, url: URL, env: Env): Promise
     return Response.json({ error: 'Authentication required' }, { status: 401 });
   }
 
-  const stub = getUserDBStub(env);
+  const stub = getUserDBStub(env, user.github_id);
 
   // GET /api/servers
   if (url.pathname === '/api/servers' && request.method === 'GET') {
@@ -354,7 +382,7 @@ async function handleThemeRoute(request: Request, env: Env): Promise<Response> {
     return Response.json({ error: 'Authentication required' }, { status: 401 });
   }
 
-  const stub = getUserDBStub(env);
+  const stub = getUserDBStub(env, user.github_id);
 
   if (request.method === 'GET') {
     return stub.fetch(new Request(`http://internal/internal/theme?user_id=${user.id}`, {
@@ -384,7 +412,7 @@ async function handleKnownHostsRoute(request: Request, url: URL, env: Env): Prom
     return Response.json({ error: 'Authentication required' }, { status: 401 });
   }
 
-  const stub = getUserDBStub(env);
+  const stub = getUserDBStub(env, user.github_id);
 
   // GET /api/known-hosts?host=X&port=Y  → 获取特定主机指纹
   // GET /api/known-hosts                 → 列出所有已知主机
@@ -432,7 +460,7 @@ async function handleAIRoute(request: Request, url: URL, env: Env): Promise<Resp
     return Response.json({ error: 'Authentication required' }, { status: 401 });
   }
 
-  const stub = getUserDBStub(env);
+  const stub = getUserDBStub(env, user.github_id);
 
   // GET /api/ai/config — return current AI config (masked)
   if (url.pathname === '/api/ai/config' && request.method === 'GET') {
@@ -478,13 +506,23 @@ async function handleAIRoute(request: Request, url: URL, env: Env): Promise<Resp
     }
 
     try {
-      const modelsUrl = `${base_url.replace(/\/$/, '')}/models`;
+      let cleanBaseUrl = base_url.replace(/\/$/, '');
+      if (cleanBaseUrl.endsWith('/chat/completions')) {
+        cleanBaseUrl = cleanBaseUrl.slice(0, -'/chat/completions'.length);
+      }
+      const modelsUrl = `${cleanBaseUrl}/models`;
+
       const res = await fetch(modelsUrl, {
+        redirect: 'manual', // Cloudflare Workers only supports 'follow' or 'manual'
         headers: {
           'Authorization': `Bearer ${api_key}`,
         },
         signal: AbortSignal.timeout(10000),
       });
+
+      if (res.status >= 300 && res.status < 400) {
+        return Response.json({ error: 'SSRF Protection: Redirects are not allowed' }, { status: 403 });
+      }
 
       if (!res.ok) {
         if (res.status === 404) {
@@ -497,7 +535,17 @@ async function handleAIRoute(request: Request, url: URL, env: Env): Promise<Resp
       }
 
       const data = await res.json() as any;
-      const models: Array<{ id: string }> = (data.data || [])
+      
+      let rawModels: any[] = [];
+      if (Array.isArray(data)) {
+        rawModels = data;
+      } else if (data && Array.isArray(data.data)) {
+        rawModels = data.data;
+      } else if (data && Array.isArray(data.models)) {
+        rawModels = data.models;
+      }
+
+      const models: Array<{ id: string }> = rawModels
         .filter((m: any) => {
           const id = m.id || '';
           return !/embedding|whisper|tts|dall-e|moderation|rerank/i.test(id);
@@ -550,6 +598,7 @@ async function handleSSHConnection(request: Request, env: Env): Promise<Response
 
   const headers = new Headers(request.headers);
   headers.set('x-cloudflare-colo', (request as any).cf?.colo || 'UNKNOWN');
+  headers.delete('x-ssh-config'); // 防御：禁止匿名连接通过 HTTP 头注入配置
 
   return stub.fetch(new Request(doUrl.toString(), { headers }));
 }
@@ -574,7 +623,11 @@ async function handleTokenSSHConnection(request: Request, env: Env, token: strin
   }
 
   // 从 UserDBDO 消费 token，获取连接配置
-  const stub = getUserDBStub(env);
+  const [githubId] = token.split(':');
+  if (!githubId) {
+    return Response.json({ error: 'Invalid token format' }, { status: 400 });
+  }
+  const stub = getUserDBStub(env, githubId);
   const tokenRes = await stub.fetch(new Request('http://internal/internal/connect-token/consume', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

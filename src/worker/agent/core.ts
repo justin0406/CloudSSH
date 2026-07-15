@@ -448,8 +448,21 @@ export class AgentCore {
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       if (signal.aborted) throw new Error('Aborted');
 
-      const res = await fetch(`${config.base_url}/chat/completions`, {
+      // Re-validate base_url at fetch time to prevent TOCTOU SSRF
+      const { validateBaseUrl } = await import('./ssrf');
+      const check = validateBaseUrl(config.base_url);
+      if (!check.valid) {
+        throw new Error(`AI base URL is blocked by SSRF protection: ${check.reason}`);
+      }
+
+      let cleanBaseUrl = config.base_url.replace(/\/$/, '');
+      if (cleanBaseUrl.endsWith('/chat/completions')) {
+        cleanBaseUrl = cleanBaseUrl.slice(0, -'/chat/completions'.length);
+      }
+
+      const res = await fetch(`${cleanBaseUrl}/chat/completions`, {
         method: 'POST',
+        redirect: 'manual', // Cloudflare Workers only supports 'follow' or 'manual'
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${config.api_key}`,
@@ -464,6 +477,10 @@ export class AgentCore {
         }),
         signal,
       });
+
+      if (res.status >= 300 && res.status < 400) {
+        throw new Error(`SSRF Protection: AI provider attempted an unauthorized redirect (HTTP ${res.status})`);
+      }
 
       if (res.ok) {
         return this.handleStreamingResponse(res, signal);
@@ -780,8 +797,20 @@ export class AgentCore {
 ${conversationText}${previousSection}`;
 
     try {
-      const res = await fetch(`${config.base_url}/chat/completions`, {
+      // Re-validate base_url for summary fetch
+      const { validateBaseUrl } = await import('./ssrf');
+      if (!validateBaseUrl(config.base_url).valid) {
+        return null;
+      }
+
+      let cleanBaseUrl = config.base_url.replace(/\/$/, '');
+      if (cleanBaseUrl.endsWith('/chat/completions')) {
+        cleanBaseUrl = cleanBaseUrl.slice(0, -'/chat/completions'.length);
+      }
+
+      const res = await fetch(`${cleanBaseUrl}/chat/completions`, {
         method: 'POST',
+        redirect: 'manual', // Cloudflare Workers only supports 'follow' or 'manual'
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${config.api_key}`,
@@ -792,7 +821,13 @@ ${conversationText}${previousSection}`;
           max_tokens: 512,
           temperature: 0.3,
         }),
+        signal: AbortSignal.timeout(10000), // Summary 10秒超时
       });
+
+      if (res.status >= 300 && res.status < 400) {
+        console.error('SSRF Summary Fetch Redirect blocked:', res.status);
+        return null;
+      }
 
       if (res.ok) {
         const data = await res.json<{ choices: Array<{ message: { content: string } }> }>();

@@ -1,102 +1,89 @@
-// Dangerous command detection + user confirmation logic
+// Blacklist-based command safety logic
 
-// Directly blocked — never executed regardless of user intent
-const BLOCKED_PATTERNS: Array<{ pattern: RegExp; label: string }> = [
-  // rm -rf / or rm -rf // — match after normalization to prevent bypass via variable expansion
-  { pattern: /\brm\s+(-[a-z]*\s+)*\/\s*($|\s)/, label: '删除根目录' },
-  { pattern: /\brm\s+(-[a-z]*\s+)*\/\/\s*($|\s)/, label: '删除根目录' },
-  // rm with path variables that could resolve to root
-  { pattern: /\brm\s+(-[a-z]*\s+)*(~\/\.\.|\/\.\.)\//, label: '删除根目录（路径遍历）' },
-  { pattern: /\bdd\s+if=\/dev\/(zero|random|urandom)\s+of=\/dev\/(sd[a-z]|nvme|vd)/, label: '覆写磁盘' },
-  { pattern: /\b:(){:|:&};:/, label: 'fork bomb' },
-  { pattern: /\bmkfs\.\w+\s+\/dev\/(sd[a-z]|nvme|vd)/, label: '格式化磁盘设备' },
-  { pattern: />\s*\/dev\/(sd[a-z]|nvme|vd)/, label: '写入磁盘设备' },
-  { pattern: /\bchpasswd\b/, label: '批量修改密码' },
-  // find -delete / -exec rm
-  { pattern: /\bfind\b.+-delete\b/, label: '递归删除（find -delete）' },
-  { pattern: /\bfind\b.+-exec\s+rm\b/, label: '递归删除（find -exec rm）' },
-  // xargs rm
-  { pattern: /\bxargs\s+.*\brm\b/, label: '批量删除（xargs rm）' },
-];
-
-// Require user confirmation before execution
-const CONFIRM_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
-  { pattern: /\brm\s+-rf\b/, reason: '递归删除操作不可逆，请确认' },
-  { pattern: /\brm\s+(-[a-z]*\s+)+[\/~]/, reason: '删除文件/目录操作不可逆，请确认' },
-  { pattern: /\b(shutdown|reboot|halt|poweroff)\b/, reason: '此操作将导致服务器重启/关机' },
-  { pattern: /\bdd\s+if=/, reason: '磁盘写入操作可能导致数据丢失' },
-  { pattern: /\bmkfs\b/, reason: '格式化操作将销毁磁盘数据' },
-  { pattern: /\bchmod\s+(-R\s+)?777\b/, reason: '权限全开存在安全风险' },
-  { pattern: /\bchown\s+(-R\s+)?root\b/, reason: '修改文件属主为 root，请确认' },
-  { pattern: /\biptables\s+(-F|-X|-P\s+INPUT\s+DROP|-P\s+FORWARD\s+DROP)/, reason: '修改防火墙规则可能导致连接中断' },
-  { pattern: /\b(ufw|firewall-cmd)\s+(disable|stop|--panic-on)/, reason: '关闭防火墙存在安全风险' },
-  { pattern: /\bwget\s.*\|\s*(ba)?sh/, reason: '远程脚本直接执行存在安全风险' },
-  { pattern: /\bcurl\s.*\|\s*(ba)?sh/, reason: '远程脚本直接执行存在安全风险' },
-  { pattern: /\bchmod\s+(-R\s+)?\+s\b/, reason: '设置 SUID/SGID 位存在安全风险' },
-  { pattern: /\bpasswd\b/, reason: '修改用户密码，请确认' },
-  // apt/yum/dnf 用 (install|remove|purge|update|upgrade)；apk 独有的 add/del 等价 install/remove。
-  { pattern: /\b(apt|yum|dnf)\s+(install|remove|purge|update|upgrade)\b/, reason: '安装/卸载/更新软件包将修改系统状态，请确认' },
-  { pattern: /\bapk\s+(add|del|upgrade|update|fix|cache)\b/, reason: '安装/卸载/更新软件包将修改系统状态，请确认' },
-];
-
-// sudo risk levels: low-risk sudo commands that don't need confirmation
-// Note: This only covers read-only system commands. Any sudo command that could
-// modify system state requires confirmation.
-const SUDO_SAFE_READ_PATTERNS: RegExp[] = [
-  // systemctl read-only commands
-  /\bsudo\s+systemctl\s+(status|is-active|is-enabled|cat)\b/,
-  // systemctl start/restart/enable — safe for most services
-  /\bsudo\s+systemctl\s+(start|restart|enable)\b/,
-  // Pure read-only system commands
-  /\bsudo\s+(journalctl|ss|netstat|lsof|df|free|uname|hostname|uptime|whoami|id|groups|ls|cat|head|tail|grep|wc|file|stat|du|find)\b/,
-  // Docker read-only commands
-  /\bsudo\s+docker\s+(ps|logs|images|inspect|version|info)\b/,
-];
-
-// sudo commands that write to disk or modify system — require confirmation
-const SUDO_WRITE_PATTERNS: RegExp[] = [
-  /\bsudo\s+(systemctl\s+)?(stop|disable)\b/,
-  /\bsudo\s+docker\s+(stop|rm|rmi|restart)\b/,
-  /\bsudo\s+user(add|del|mod)\b/,
-  /\bsudo\s+group(add|del|mod)\b/,
-  /\bsudo\s+(mount|umount)\b/,
-  /\bsudo\s+(crontab|at)\b/,
-];
-
+/**
+ * Check if a command is blocked (never allowed)
+ * This is the ultimate fallback to prevent catastrophic destruction.
+ */
 export function isBlockedCommand(command: string): { blocked: boolean; reason?: string } {
-  for (const { pattern, label } of BLOCKED_PATTERNS) {
-    if (pattern.test(command)) {
-      return { blocked: true, reason: `此操作已被禁止：${label}` };
+  const trimmed = command.trim();
+  const normalized = trimmed.toLowerCase();
+
+  // Fork bombs
+  if (trimmed.includes(':(){ :|:& };:') || trimmed.includes('fork while fork')) {
+    return { blocked: true, reason: '禁止执行 Fork Bomb (资源耗尽攻击)' };
+  }
+
+  // rm -rf / and variants — flag 顺序无关：只要短选项同时含 r 和 f，且目标是
+  // 根目录、家目录或根下通配即视为极度危险。覆盖 rm -rf /、rm -fr /、rm -r -f / 等。
+  if (/(^|\s)rm\s+-[a-zA-Z]+/.test(normalized)) {
+    const rmMatch = normalized.match(/(^|\s)rm\s+(-[a-zA-Z-]+(?:\s+\S+)?)/);
+    if (rmMatch) {
+      const flags = rmMatch[2];
+      const hasR = /r/.test(flags);
+      const hasF = /f/.test(flags);
+      if (hasR && hasF) {
+        // 提取目标参数（首个非 flag 段）
+        const segments = normalized.split(/\s+/);
+        const rmIdx = segments.indexOf('rm');
+        const flagEnd = segments.findIndex((s, i) => i > rmIdx && !s.startsWith('-'));
+        const target = flagEnd > 0 ? segments[flagEnd] : '';
+        if (/^(\/|~\/?|\/\*?|\*?)$/.test(target)) {
+          return { blocked: true, reason: '禁止执行高危删除操作 (rm -rf /)' };
+        }
+      }
     }
   }
+  
+  // Wiping disk
+  if (/(^|\s)mkfs(\.[a-z0-9]+)?\s+/.test(normalized)) {
+    return { blocked: true, reason: '禁止格式化磁盘' };
+  }
+  if (/(^|\s)dd\s+.*of=\/dev\/(sd|hd|nvme|vd)[a-z0-9]/.test(normalized)) {
+    return { blocked: true, reason: '禁止覆盖块设备' };
+  }
+
   return { blocked: false };
 }
 
+/**
+ * Check if a command requires mandatory user confirmation.
+ * The AI is the "brain" and can choose to ask for confirmation via the ask_user_confirmation tool.
+ * This is just a fallback for extremely high-risk commands that could break the system.
+ */
 export function needsConfirmation(command: string): { required: boolean; reason?: string } {
-  // Blocked commands are rejected outright by the caller — they don't need confirmation
-  if (isBlockedCommand(command).blocked) {
-    return { required: false };
-  }
+  const trimmed = command.trim();
+  const normalized = trimmed.toLowerCase();
+  
+  // 高危操作黑名单（正则表达式匹配）
+  const DANGEROUS_PATTERNS = [
+    { pattern: /(^|\s)rm(\s|$)/, reason: '删除文件操作' },
+    { pattern: /(^|\s)reboot(\s|$)/, reason: '重启服务器' },
+    { pattern: /(^|\s)shutdown(\s|$)/, reason: '关闭服务器' },
+    { pattern: /(^|\s)halt(\s|$)/, reason: '停止服务器' },
+    { pattern: /(^|\s)poweroff(\s|$)/, reason: '关闭服务器电源' },
+    { pattern: /(^|\s)init\s+[06](\s|$)/, reason: '更改运行级别(关机或重启)' },
+    { pattern: /(^|\s)passwd(\s|$)/, reason: '修改密码' },
+    { pattern: /(^|\s)chown\s+-r(\s|$)/i, reason: '递归修改文件所有者' },
+    { pattern: /(^|\s)chmod\s+-r(\s|$)/i, reason: '递归修改文件权限' },
+    { pattern: /(^|\s)fdisk(\s|$)/, reason: '磁盘分区操作' },
+    { pattern: /(^|\s)parted(\s|$)/, reason: '磁盘分区操作' },
+    { pattern: /(^|\s)dd(\s|$)/, reason: '低级磁盘拷贝/覆盖' },
+    { pattern: /(^|\s)iptables\s+-f(\s|$)/i, reason: '清空防火墙规则' },
+    { pattern: /(^|\s)iptables\s+-x(\s|$)/i, reason: '清空自定义链表' },
+    { pattern: /(^|\s)ufw\s+disable(\s|$)/i, reason: '禁用防火墙' },
+    // 杀全部进程（一锅端），与按 PID 杀进程的 kill 不同，破坏面广且难以恢复
+    { pattern: /(^|\s)kill\s+-9\s+(-1|0|1)(\s|$)/, reason: '杀死全部进程' },
+    { pattern: /(^|\s)kill\s+--signal\s+sigkill(\s|$)/i, reason: '杀死进程' },
+    // 远程脚本执行（curl/wget 管道给 shell），普通 curl/wget 不受影响
+    { pattern: /(curl|wget)\b[^|]*\|\s*(sh|bash)(\s|$)/i, reason: '远程下载并执行脚本' },
+    // find 递归删除（直接 -delete 或 -exec rm），危险面广
+    { pattern: /(^|\s)find\s+.*-delete(\s|$)/, reason: 'find 递归删除文件' },
+    { pattern: /(^|\s)find\s+.*-exec\s+rm(\s|$)/, reason: 'find 递归执行 rm' },
+  ];
 
-  // Check confirm patterns
-  for (const { pattern, reason } of CONFIRM_PATTERNS) {
-    if (pattern.test(command)) {
-      return { required: true, reason };
-    }
-  }
-
-  // sudo: check if it's a safe read-only command
-  if (command.includes('sudo ')) {
-    // First check if it's a known write operation
-    const isWriteOp = SUDO_WRITE_PATTERNS.some(p => p.test(command));
-    if (isWriteOp) {
-      return { required: true, reason: '此 sudo 命令修改系统状态，请确认' };
-    }
-
-    // Then check if it's a known safe read operation
-    const isSafeRead = SUDO_SAFE_READ_PATTERNS.some(p => p.test(command));
-    if (!isSafeRead) {
-      return { required: true, reason: '此 sudo 命令存在风险，请确认' };
+  for (const { pattern, reason } of DANGEROUS_PATTERNS) {
+    if (pattern.test(normalized)) {
+      return { required: true, reason: `${reason}，为保证安全需要确认` };
     }
   }
 
